@@ -1,0 +1,5 @@
+# Auto detect text files and perform LF normalization
+* text=auto
+
+# Task Scheduler sample must stay UTF-16 with BOM and CRLF — don't normalize
+*.sample.xml -text
