@@ -3,7 +3,7 @@
         <ProjectGuid>{2C51B089-9560-4018-91F2-B583D20EBF9E}</ProjectGuid>
         <MainSource>ValheimServerRestart.dpr</MainSource>
         <Base>True</Base>
-        <Config Condition="'$(Config)'==''">Release</Config>
+        <Config Condition="'$(Config)'==''">Debug</Config>
         <ProjectName Condition="'$(ProjectName)'==''">ValheimServerRestart</ProjectName>
         <TargetedPlatforms>1</TargetedPlatforms>
         <AppType>Console</AppType>

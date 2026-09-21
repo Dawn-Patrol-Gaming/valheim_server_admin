@@ -11,7 +11,7 @@ program ValheimServerRestart;
 
 uses
   Winapi.Windows, Winapi.TlHelp32, System.SysUtils, System.DateUtils, System.IOUtils,
-  System.IniFiles, System.SyncObjs, System.Classes, System.Zip, System.Masks;
+  System.IniFiles, System.SyncObjs, System.Classes, System.Zip, System.Masks, System.StrUtils;
 
 const
   ATTACH_PARENT_PROCESS = DWORD(-1);
@@ -579,6 +579,88 @@ begin
 end;
 
 {
+Adds one filesystem entry to an already-open zip. A file is stored under its name
+relative to RootDir; a FOLDER has every file beneath it added recursively, each
+under its path relative to RootDir — so the folder's own name is preserved as the
+top level inside the archive (restoring the zip recreates <Folder>\... verbatim).
+Returns the number of files actually written.
+
+This is what makes the tool work with the Valheim 1.0 save format, where a world
+(and each rolling auto-backup) is a FOLDER of chunked files rather than a flat
+<World>.db/.fwl pair.
+}
+function AddEntryToZip(Zip: TZipFile; const RootDir, EntryPath: string): Integer;
+var
+  Base, Rel, F: string;
+  SubFiles: TArray<string>;
+begin
+  Result := 0;
+  Base := IncludeTrailingPathDelimiter(RootDir);
+  if TDirectory.Exists(EntryPath) then
+  begin
+    SubFiles := TDirectory.GetFiles(EntryPath, '*', TSearchOption.soAllDirectories);
+    for F in SubFiles do
+    begin
+      Rel := F;
+      if Rel.StartsWith(Base, True) then
+        Rel := Rel.Substring(Length(Base));
+      Zip.Add(F, Rel);
+      Inc(Result);
+    end;
+  end //if TDirectory.Exists(EntryPath) then
+  else if TFile.Exists(EntryPath) then
+  begin
+    Rel := EntryPath;
+    if Rel.StartsWith(Base, True) then
+      Rel := Rel.Substring(Length(Base));
+    Zip.Add(EntryPath, Rel);
+    Result := 1;
+  end; //else if TFile.Exists(EntryPath) then
+end;
+
+{
+Zips a single top-level entry (a folder or a loose file) that lives directly in
+SourceDir into DestDir as <Prefix><EntryName>_<timestamp><Suffix>.zip, preserving
+the entry's own name inside the archive. One entry, one zip — the whole point of
+the per-world / per-backup layout. Returns True if the zip was written (even if
+the entry happened to be empty); False, with the reason logged, on any error.
+}
+function ZipEntry(const Description, SourceDir, EntryPath, DestDir, Prefix, Suffix: string): Boolean;
+var
+  Zip: TZipFile;
+  ZipPath, EntryName: string;
+  Count: Integer;
+begin
+  Result := False;
+  EntryName := ExtractFileName(ExcludeTrailingPathDelimiter(EntryPath));
+  try
+    if not TDirectory.Exists(DestDir) then
+      TDirectory.CreateDirectory(DestDir);
+
+    ZipPath := TPath.Combine(DestDir,
+      Prefix + EntryName + '_' + FormatDateTime('yyyy_mm_dd_hh_nn_ss', Now) + Suffix + '.zip');
+
+    Zip := TZipFile.Create;
+    try
+      Zip.Open(ZipPath, zmWrite);
+      Count := AddEntryToZip(Zip, SourceDir, EntryPath);
+      Zip.Close;
+    finally
+      Zip.Free;
+    end;
+
+    if Count = 0 then
+      Log('WARNING: ' + Description + ' "' + EntryName + '" had no files - empty archive written: ' + ZipPath)
+    else
+      Log(Description + ' archive written: ' + ZipPath + ' (' + Count.ToString + ' file(s)).');
+    Result := True;
+  except
+    on E: Exception do
+      Log('WARNING: ' + Description + ' archive of "' + EntryName + '" failed: ' + E.ClassName + ' - ' + E.Message);
+  end;
+end;
+
+{
 Zips files matching FileMask under SourceDir (recursively if Recurse, preserving
 folder structure) into BACKUP_DIR as <Prefix>yyyy_mm_dd_hh_nn_ss<Suffix>.zip.
 Prefix and Suffix may be blank. Files whose NAME matches any mask in the
@@ -669,16 +751,94 @@ begin
 end;
 
 {
-Backs up the world save folder (.db/.fwl plus the .old pair, recursively).
-Valheim's rolling auto-backups are EXCLUDED — they belong to the AutoArchive
-sweep, keeping a clean separation between the two archives. Excluded even if
-that sweep is disabled or failed, so they never leak into the worlds zip.
+Backs up the live world saves. Since Valheim 1.0 each world in worlds_local is a
+FOLDER (<World>\ holding _main.N.db2 / .fwl2 / .chunks / *.chunk / _main.N.ok), so
+every top-level world folder is zipped to its OWN archive:
+  <WorldsPrefix><World>_<timestamp><WorldsSuffix>.zip
+The rolling auto-backup folders (<World>_backup_auto-*) are NOT touched here — they
+belong to the AutoArchive sweep, keeping the two archives cleanly separated (and
+they are skipped even if that sweep is disabled, so they never bloat a world zip).
+
+For backward compatibility — a server still on the pre-1.0 flat format, or legacy
+<World>.db/.fwl[.old] files left beside a world that has since converted — any
+loose top-level FILES that are not auto-backups and not excluded by [Backup]
+ExcludeMasks (default *.old) are gathered into one extra
+<WorldsPrefix>loose_<timestamp><WorldsSuffix>.zip so nothing at the root is
+silently dropped. Returns True if at least one archive was written; a
+failed/skipped backup is non-fatal (logged by the caller).
 }
 function BackupWorlds: Boolean;
+var
+  Dirs, AllFiles: TArray<string>;
+  Loose: TArray<string>;
+  Dir, F, ZipPath: string;
+  Zip: TZipFile;
+  Count: Integer;
 begin
-  // Also excluded: anything in [Backup] ExcludeMasks (default *.old - Valheim's
-  // own one-generation fallback pair, redundant inside a timestamped archive).
-  Result := ZipFolder('worlds', WORLDS_DIR, '*', WORLDS_PREFIX, WORLDS_SUFFIX, True, AUTO_FILE_MASK + ';' + EXCLUDE_MASKS);
+  Result := False;
+
+  if (WORLDS_DIR = '') or (BACKUP_DIR = '') then
+  begin
+    Log('worlds backup skipped: WorldsDir or BackupDir not set in ' + ConfigPath + '.');
+    Exit;
+  end; //if (WORLDS_DIR = '') or (BACKUP_DIR = '') then
+
+  if not TDirectory.Exists(WORLDS_DIR) then
+  begin
+    Log('WARNING: worlds backup skipped - folder not found: ' + WORLDS_DIR);
+    Exit;
+  end; //if not TDirectory.Exists(WORLDS_DIR) then
+
+  // 1) Each live world folder -> its own zip. Skip the *_backup_auto-* folders:
+  //    those are the AutoArchive sweep's job, kept in a separate archive.
+  Dirs := TDirectory.GetDirectories(WORLDS_DIR, '*', TSearchOption.soTopDirectoryOnly);
+  for Dir in Dirs do
+  begin
+    if MatchesAnyMask(ExtractFileName(ExcludeTrailingPathDelimiter(Dir)), AUTO_FILE_MASK) then
+      Continue; // rolling auto-backup folder - handled by AutoArchive
+    if ZipEntry('worlds', WORLDS_DIR, Dir, BACKUP_DIR, WORLDS_PREFIX, WORLDS_SUFFIX) then
+      Result := True;
+  end; //for Dir in Dirs do
+
+  // 2) Loose top-level files (a pre-1.0 flat world, or legacy leftovers beside a
+  //    converted one) -> one combined zip. Excludes auto-backups and the
+  //    [Backup] ExcludeMasks (default *.old, Valheim's one-generation fallback).
+  AllFiles := TDirectory.GetFiles(WORLDS_DIR, '*', TSearchOption.soTopDirectoryOnly);
+  SetLength(Loose, 0);
+  for F in AllFiles do
+    if not MatchesAnyMask(ExtractFileName(F), AUTO_FILE_MASK + ';' + EXCLUDE_MASKS) then
+    begin
+      SetLength(Loose, Length(Loose) + 1);
+      Loose[High(Loose)] := F;
+    end; //if not MatchesAnyMask(...) then
+
+  if Length(Loose) > 0 then
+  begin
+    try
+      if not TDirectory.Exists(BACKUP_DIR) then
+        TDirectory.CreateDirectory(BACKUP_DIR);
+      ZipPath := TPath.Combine(BACKUP_DIR,
+        WORLDS_PREFIX + 'loose_' + FormatDateTime('yyyy_mm_dd_hh_nn_ss', Now) + WORLDS_SUFFIX + '.zip');
+      Zip := TZipFile.Create;
+      try
+        Zip.Open(ZipPath, zmWrite);
+        Count := 0;
+        for F in Loose do
+          Inc(Count, AddEntryToZip(Zip, WORLDS_DIR, F));
+        Zip.Close;
+      finally
+        Zip.Free;
+      end;
+      Log('worlds archive written: ' + ZipPath + ' (' + Count.ToString + ' loose file(s)).');
+      Result := True;
+    except
+      on E: Exception do
+        Log('WARNING: loose worlds file backup failed: ' + E.ClassName + ' - ' + E.Message);
+    end; //try..except
+  end; //if Length(Loose) > 0 then
+
+  if not Result then
+    Log('WARNING: worlds backup produced no archives - nothing to back up in ' + WORLDS_DIR + '.');
 end;
 
 {
@@ -692,27 +852,33 @@ begin
 end;
 
 {
-Zips Valheim's rolling auto-backup files
-(<World>_backup_auto-<timestamp>.db/.fwl) out of WorldsDir into
-[AutoArchive] ArchiveDir, then deletes the archived originals
-(DeleteAfterArchive=1). The main <World>.db/.fwl and the .old pair are NEVER
-touched — the mask only matches the auto-backups, which the server rewrites
-from scratch each backup cycle. Safe to run while the server is up: the
-auto-backup files are finished copies the server is no longer writing, and
-the server is neither stopped nor restarted. If a file happens to be locked
-(e.g. the server is creating a fresh auto-backup right now), the zip fails as
-a whole and NOTHING is deleted — the next scheduled run picks everything up.
-Runs standalone via the /autoarchive parameter, and also as a step of the
-restart cycle (RunOnRestart=1) so the worlds backup and the auto-backup
-archives stay cleanly separated.
-Returns the process exit code (0 = archived or nothing to do, 5 = failed).
+Sweeps Valheim's rolling auto-backups out of WorldsDir into [AutoArchive]
+ArchiveDir, then deletes each archived original (DeleteAfterArchive=1).
+
+Since Valheim 1.0 each auto-backup is a FOLDER (<World>_backup_auto-<date>-<time>\)
+of chunked files, not a flat <World>_backup_auto-*.db/.fwl pair, so this enumerates
+top-level FOLDERS matching AUTO_FILE_MASK — and, for a pre-1.0 / un-migrated server,
+also any loose FILES still matching it. Each matching entry is zipped to its OWN
+archive (<AutoPrefix><EntryName>_<timestamp><AutoSuffix>.zip) and, if
+DeleteAfterArchive=1, removed only AFTER its own zip has been written successfully.
+
+The live world folder (<World>\), the legacy .old pair and any other worlds_local
+content are NEVER matched — the mask only ever matches the auto-backups, which the
+server recreates from scratch each backup cycle. Safe to run while the server is up:
+the auto-backups are finished copies the server is no longer writing, and the server
+is neither stopped nor restarted. If one entry is locked (e.g. a backup is being
+written right now) its zip fails, that entry alone is left in place for the next run,
+and the others still archive. Runs standalone via the /autoarchive parameter, and
+also as a step of the restart cycle (RunOnRestart=1) so the worlds backup and the
+auto-backup archives stay cleanly separated.
+Returns the process exit code (0 = archived or nothing to do, 5 = a zip failed).
 }
 function AutoArchive: Integer;
 var
-  Zip: TZipFile;
-  Files: TArray<string>;
-  SrcFile, ZipPath: string;
-  Deleted, Failed: Integer;
+  Dirs, LegacyFiles, Entries: TArray<string>;
+  Entry: string;
+  i, Zipped, Deleted, Failed: Integer;
+  AnyZipFailed: Boolean;
 begin
   Result := 5;
 
@@ -728,71 +894,77 @@ begin
     Exit;
   end;//if not TDirectory.Exists(WORLDS_DIR) then
 
-  try
-    // Top level only: worlds_local keeps everything flat, and not recursing
-    // means a stray subfolder can never be swept into the delete step below.
-    Files := TDirectory.GetFiles(WORLDS_DIR, AUTO_FILE_MASK, TSearchOption.soTopDirectoryOnly);
-    // Always state the find result, found or not — an unattended run must
-    // leave no question about whether the sweep saw anything to do.
-    Log('Auto-archive: found ' + Length(Files).ToString + ' file(s) matching ' + AUTO_FILE_MASK + ' in ' + WORLDS_DIR + '.');
-    if Length(Files) = 0 then
-    begin
-      Log('Auto-archive: nothing to do.');
-      Result := 0;
-      Exit;
-    end;//if Length(Files) = 0 then
+  // Top level only, both folders (1.0) and loose files (legacy). Not recursing
+  // means a stray file inside a world folder can never be swept into delete.
+  Dirs := TDirectory.GetDirectories(WORLDS_DIR, AUTO_FILE_MASK, TSearchOption.soTopDirectoryOnly);
+  LegacyFiles := TDirectory.GetFiles(WORLDS_DIR, AUTO_FILE_MASK, TSearchOption.soTopDirectoryOnly);
 
-    if not TDirectory.Exists(AUTO_ARCHIVE_DIR) then
-      TDirectory.CreateDirectory(AUTO_ARCHIVE_DIR);
+  SetLength(Entries, Length(Dirs) + Length(LegacyFiles));
+  for i := 0 to High(Dirs) do
+    Entries[i] := Dirs[i];
+  for i := 0 to High(LegacyFiles) do
+    Entries[Length(Dirs) + i] := LegacyFiles[i];
 
-    ZipPath := TPath.Combine(AUTO_ARCHIVE_DIR, AUTO_PREFIX + FormatDateTime('yyyy_mm_dd_hh_nn_ss', Now) + AUTO_SUFFIX + '.zip');
-    Log('Auto-archive: archiving ' + Length(Files).ToString + ' file(s) from ' + WORLDS_DIR + '...');
-
-    Zip := TZipFile.Create;
-    try
-      Zip.Open(ZipPath, zmWrite);
-      for SrcFile in Files do
-        Zip.Add(SrcFile, ExtractFileName(SrcFile));
-      Zip.Close;
-    finally
-      Zip.Free;
-    end;
-    Log('Auto-archive: written ' + ZipPath);
-  except
-    on E: Exception do
-    begin
-      Log('ERROR: Auto-archive failed: ' + E.ClassName + ' - ' + E.Message);
-      Log('Auto-archive: nothing was deleted.');
-      Exit;
-    end;//on E: Exception do
-  end;
-
-  Result := 0;
-
-  if not AUTO_DELETE then
+  // Always state the find result, found or not — an unattended run must leave no
+  // question about whether the sweep saw anything to do.
+  Log('Auto-archive: found ' + Length(Entries).ToString + ' backup entr' +
+    IfThen(Length(Entries) = 1, 'y', 'ies') + ' matching ' + AUTO_FILE_MASK + ' in ' + WORLDS_DIR +
+    ' (' + Length(Dirs).ToString + ' folder(s), ' + Length(LegacyFiles).ToString + ' loose file(s)).');
+  if Length(Entries) = 0 then
   begin
-    Log('Auto-archive: DeleteAfterArchive=0 - archived files left in place.');
+    Log('Auto-archive: nothing to do.');
+    Result := 0;
     Exit;
-  end;//if not AUTO_DELETE then
+  end;//if Length(Entries) = 0 then
 
-  // Delete exactly the files that went into the zip — never re-enumerate, so
-  // an auto-backup created after the snapshot above survives to the next run.
+  if not TDirectory.Exists(AUTO_ARCHIVE_DIR) then
+    TDirectory.CreateDirectory(AUTO_ARCHIVE_DIR);
+
+  // Each entry -> its own zip; delete it only after its own zip succeeds. Snapshot
+  // was taken above, so an auto-backup created mid-run survives to the next run.
+  Zipped := 0;
   Deleted := 0;
   Failed := 0;
-  for SrcFile in Files do
+  AnyZipFailed := False;
+  for Entry in Entries do
   begin
+    if not ZipEntry('auto-backup', WORLDS_DIR, Entry, AUTO_ARCHIVE_DIR, AUTO_PREFIX, AUTO_SUFFIX) then
+    begin
+      AnyZipFailed := True;
+      Log('  Left in place (zip failed): ' + Entry);
+      Continue; // never delete an entry we did not manage to archive
+    end;//if not ZipEntry(...) then
+    Inc(Zipped);
+
+    if not AUTO_DELETE then
+      Continue;
+
     try
-      TFile.Delete(SrcFile);
+      if TDirectory.Exists(Entry) then
+        TDirectory.Delete(Entry, True) // recursive: the whole backup folder
+      else
+        TFile.Delete(Entry);
       Inc(Deleted);
     except
       on E: Exception do
       begin
         Inc(Failed);
-        Log('  Could not delete ' + SrcFile + ': ' + E.Message);
+        Log('  Could not delete ' + Entry + ': ' + E.Message);
       end;//on E: Exception do
     end;//try..except
-  end;//for SrcFile in Files do
-  Log(Format('Auto-archive: removed originals - %d deleted, %d skipped.', [Deleted, Failed]));
+  end;//for Entry in Entries do
+
+  if AUTO_DELETE then
+    Log(Format('Auto-archive: %d archived, %d original(s) removed, %d delete failure(s).', [Zipped, Deleted, Failed]))
+  else
+    Log(Format('Auto-archive: %d archived - DeleteAfterArchive=0, originals left in place.', [Zipped]));
+
+  // A delete failure is non-fatal (the archive exists; the leftover folder is
+  // retried next run). Only a failed zip is reported as an error exit.
+  if AnyZipFailed then
+    Result := 5
+  else
+    Result := 0;
 end;
 
 {
@@ -990,7 +1162,7 @@ begin
   // The official start_headless_server.bat sets SteamAppId=892970 before
   // launching the server; set it in our own environment so the child inherits
   // it. Configurable via [Server] SteamAppIdEnv (blank = don't set).
-  if SERVER_APPID_ENV <> '' then
+ if SERVER_APPID_ENV <> '' then
     if not SetEnvironmentVariable('SteamAppId', PChar(SERVER_APPID_ENV)) then
       Log('WARNING: could not set SteamAppId=' + SERVER_APPID_ENV + ': ' + SysErrorMessage(GetLastError));
 

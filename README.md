@@ -16,13 +16,27 @@ Doing that reliably from a separate process is fiddly (console attachment, integ
 
 ---
 
+## Valheim 1.0 save format
+
+Valheim **1.0** changed the on-disk save layout, and this tool backs up the new format:
+
+- **A world is now a folder.** `worlds_local` no longer holds a flat `<World>.db` + `<World>.fwl` pair. Each world is a **folder** named exactly after the world (`<World>\`), containing chunked pieces — `_main.N.fwl2` (seed/metadata), `_main.N.db2` (world data), `_main.N.chunks` (index), many `XX_XX__X_X.chunk` terrain files, and a `_main.N.ok` save-complete marker (`N` is a generation counter). Only the pieces that change are rewritten each save, which is why 1.0 saves are faster.
+- **Rolling auto-backups are folders too.** Valheim keeps ~4 rolling backups plus one on update, each as its own folder `<World>_backup_auto-<date>-<time>\` inside `worlds_local`.
+- **Back up / restore the *whole* folder.** A partial copy makes a broken world. This tool always zips a complete top-level entry, and each zip preserves the folder name inside it, so restoring recreates `<World>\…` verbatim.
+- **Old worlds convert in place.** The first time a 1.0 server loads a pre-1.0 world it converts it to the folder format (after writing a backup) and leaves the old `<World>.db`/`.fwl`/`.old` files beside the new folder. This tool still captures those loose legacy files (into a `<prefix>loose_<timestamp>.zip`) and still handles pre-1.0 servers that remain on the flat format, so it works across the transition.
+- **The list files are unchanged.** `adminlist.txt`, `bannedlist.txt` and `permittedlist.txt` still sit at the Valheim root and are backed up as before.
+
+> The graceful **Ctrl+C** shutdown is unaffected by this change — it's a console signal, independent of the save format — so the server still saves cleanly on stop.
+
+---
+
 ## Features
 
 - **Graceful shutdown** via `AttachConsole` + `GenerateConsoleCtrlEvent(CTRL_C_EVENT)` — the same thing as pressing Ctrl+C in the server window.
 - **Waits for a clean exit** (configurable timeout) before continuing — world save time scales with world size.
-- **Timestamped world backup** — zips the entire `worlds_local` folder (`.db`/`.fwl` plus Valheim's own rolling `.old`/auto-backup files) while the server is stopped, so the files are flushed and unlocked.
+- **Timestamped world backup** — zips each world in `worlds_local` to **its own** archive while the server is stopped (files flushed and unlocked). Since **Valheim 1.0** a world is a *folder* (`<World>\` holding `_main.N.db2`/`.fwl2`/`.chunks`/`*.chunk`/`.ok`), not a flat `.db`/`.fwl` pair, so every top-level world folder becomes `<prefix><World>_<timestamp><suffix>.zip`. Legacy flat/`.old` leftovers still work (see [Valheim 1.0 save format](#valheim-10-save-format)).
 - **Player-list backup** — zips `adminlist.txt`, `bannedlist.txt` and `permittedlist.txt` to a separate archive.
-- **Auto-backup archiving mode** (`/autoarchive`) — a second, independent schedulable mode that zips Valheim's rolling `<World>_backup_auto-*` files out of `worlds_local` and removes the originals, **without touching the running server**. Keeps the save folder from filling up with 50 MB+ copies while preserving every one of them in timestamped archives.
+- **Auto-backup archiving mode** (`/autoarchive`) — a second, independent schedulable mode that sweeps Valheim's rolling `<World>_backup_auto-*` backups out of `worlds_local`, zipping **each one to its own archive** and removing the original, **without touching the running server**. Since 1.0 those backups are *folders* too; the mode handles them (and legacy backup files) and keeps `worlds_local` from filling up with 100 MB+ copies while preserving every one in a timestamped archive.
 - **Optional SteamCMD update** of the dedicated server (app `896660`) before relaunch, with SteamCMD's output captured line-by-line into the log.
 - **Automatic restart** with your configured launch arguments, including the `SteamAppId=892970` environment variable the official launch script sets.
 - **All settings in an `.ini` file** — no recompilation to change paths, arguments, or timings.
@@ -81,16 +95,24 @@ ShutdownTimeoutSec=120
 RestartDelaySec=10
 
 [Backup]
-; Folder containing the world saves (.db/.fwl) to back up (zipped recursively).
+; Folder containing the world saves to back up. Each world FOLDER directly under
+; it (Valheim 1.0 stores a world as <World>\...) is zipped to its own archive;
+; the *_backup_auto-* backup folders are skipped here (see [AutoArchive]).
 ; Blank = skip backup. NOTE: this is per-user — it must be the profile of the
 ; account the SERVER runs under. If you launch with -savedir, point this there.
 WorldsDir=%USERPROFILE%\AppData\LocalLow\IronGate\Valheim\worlds_local
 ; Folder where the timestamped backup zips are written.
 ; Keep this OUTSIDE the server install folder so a Steam update can't wipe it.
 BackupDir=C:\Valheim_Backups
-; Worlds backup file name = <prefix><timestamp><suffix>.zip. Both may be blank.
+; Worlds backup file name = <prefix><World>_<timestamp><suffix>.zip (one per world
+; folder). Any loose legacy files go to <prefix>loose_<timestamp><suffix>.zip.
+; Both prefix and suffix may be blank.
 WorldsBackupPrefix=worlds_
 WorldsBackupSuffix=
+; Semicolon-separated name masks excluded from the regular backups. Default *.old
+; drops Valheim's one-generation fallback pair (redundant inside a timestamped
+; archive). Blank = exclude nothing.
+ExcludeMasks=*.old
 ; Folder whose top-level *.txt files (adminlist/bannedlist/permittedlist) are
 ; zipped to a separate archive. Blank = skip.
 ConfigDir=%USERPROFILE%\AppData\LocalLow\IronGate\Valheim
@@ -107,18 +129,23 @@ ServerLogDir=
 
 [AutoArchive]
 ; Settings for the "/autoarchive" command-line mode (see below). Source folder
-; is WorldsDir above; these files are zipped here and then deleted.
+; is WorldsDir above; each matching backup is zipped here and then deleted.
 ; Keep this OUTSIDE the server install folder too.
 ArchiveDir=C:\Valheim_Backups\auto
-; Which files count as auto-backups. The default matches Valheim's
-; <World>_backup_auto-<timestamp>.db/.fwl naming and can never match the
-; main <World>.db/.fwl or the .old pair.
+; Which top-level entries count as auto-backups. The default matches Valheim
+; 1.0's <World>_backup_auto-<date>-<time> backup FOLDERS (and any legacy
+; <World>_backup_auto-*.db/.fwl files) and never matches the live <World> folder
+; or the .old pair.
 FileMask=*_backup_auto-*
-; Archive file name = <prefix><timestamp><suffix>.zip. Both may be blank.
+; Archive file name = <prefix><BackupName>_<timestamp><suffix>.zip (one per
+; backup). Both prefix and suffix may be blank.
 ArchivePrefix=auto_
 ArchiveSuffix=
-; 1 = delete the originals after a successful zip; 0 = archive only.
+; 1 = delete each original after ITS OWN zip succeeds; 0 = archive only.
 DeleteAfterArchive=1
+; 1 = also run the auto-archive sweep during the restart cycle (before the worlds
+; backup) so the two archives stay separate; 0 = only run it via /autoarchive.
+RunOnRestart=1
 
 [Update]
 ; Set to 1 to run a SteamCMD update (after backup, before restart). 0 = skip.
@@ -145,16 +172,18 @@ InstallDir=C:\SteamCMD\Valheim_Server
 | `Server` | `SteamAppIdEnv` | Value for the `SteamAppId` environment variable on relaunch (official script uses `892970`). Blank = don't set it. |
 | `Restart` | `ShutdownTimeoutSec` | How long to wait for a clean exit before reporting failure. |
 | `Restart` | `RestartDelaySec` | Pause between shutdown and relaunch. |
-| `Backup` | `WorldsDir` | Folder zipped into the worlds backup (recursive). Blank disables backup. |
+| `Backup` | `WorldsDir` | Folder holding the worlds. Each top-level **world folder** (`<World>\`, the 1.0 format) is zipped to its own archive; the `*_backup_auto-*` folders are skipped (handled by `/autoarchive`). Blank disables backup. |
 | `Backup` | `BackupDir` | Destination folder for the zips (created if missing). **Point this *outside* the server install folder.** |
-| `Backup` | `WorldsBackupPrefix` / `WorldsBackupSuffix` | Optional text before/after the timestamp in the worlds backup file name (`<prefix><timestamp><suffix>.zip`). Either may be blank. |
+| `Backup` | `WorldsBackupPrefix` / `WorldsBackupSuffix` | Optional text before/after the worlds backup file name `<prefix><World>_<timestamp><suffix>.zip` (one per world; loose legacy files go to `<prefix>loose_<timestamp><suffix>.zip`). Either may be blank. |
+| `Backup` | `ExcludeMasks` | Semicolon-separated name masks excluded from the worlds/config backups (matched against the top-level entry name). Default `*.old`. Blank excludes nothing. |
 | `Backup` | `ConfigDir` | Folder whose **top-level** `*.txt` files are zipped to a separate backup (the admin/banned/permitted lists). Blank disables. |
 | `Backup` | `ConfigBackupPrefix` / `ConfigBackupSuffix` | Optional text before/after the timestamp in the config backup file name. Either may be blank. |
 | `Cleanup` | `ServerLogDir` | Folder whose files are deleted after a successful backup. **Blank (default) disables** — Valheim has no per-session log folder. |
 | `AutoArchive` | `ArchiveDir` | Destination folder for `/autoarchive` zips (created if missing). Keep it outside the server install folder. |
-| `AutoArchive` | `FileMask` | Which files in `WorldsDir` count as auto-backups. Default `*_backup_auto-*`. |
-| `AutoArchive` | `ArchivePrefix` / `ArchiveSuffix` | Optional text before/after the timestamp in the archive file name. Either may be blank. |
-| `AutoArchive` | `DeleteAfterArchive` | `1` (default) = delete the originals after a successful zip; `0` = archive only. |
+| `AutoArchive` | `FileMask` | Which top-level entries in `WorldsDir` count as auto-backups — matches the 1.0 `<World>_backup_auto-<date>-<time>` **folders** (and legacy backup files). Default `*_backup_auto-*`. |
+| `AutoArchive` | `ArchivePrefix` / `ArchiveSuffix` | Optional text before/after the archive file name `<prefix><BackupName>_<timestamp><suffix>.zip` (one per backup). Either may be blank. |
+| `AutoArchive` | `DeleteAfterArchive` | `1` (default) = delete each original after **its own** zip succeeds; `0` = archive only. |
+| `AutoArchive` | `RunOnRestart` | `1` (default) = also run the sweep during the restart cycle (before the worlds backup); `0` = only via `/autoarchive`. |
 | `Update` | `EnableUpdate` | `1` = run a SteamCMD update before restart; `0` = skip. |
 | `Update` | `SteamCmdPath` | Full path to `steamcmd.exe`. |
 | `Update` | `SteamAppId` | Steam app id of the Valheim dedicated server (`896660`; configurable in case it ever changes). |
@@ -174,7 +203,7 @@ The default `Args` mirrors the official `start_headless_server.bat`. Commonly us
 | `-crossplay` | Use the PlayFab backend (console/Game Pass players can join; no port-forwarding needed). Omit for Steam-only. |
 | `-savedir <path>` | Override the save location. If used, update `WorldsDir`/`ConfigDir` to match. |
 | `-saveinterval <sec>` | Autosave interval (default 1800 = 30 min). |
-| `-backups` / `-backupshort` / `-backuplong` | Tune Valheim's own rolling auto-backups (kept inside `worlds_local`; they get included in this tool's zip, and [`/autoarchive`](#auto-backup-archiving-autoarchive) can sweep them out on a schedule). |
+| `-backups` / `-backupshort` / `-backuplong` | Tune Valheim's own rolling auto-backups (kept inside `worlds_local` as `<World>_backup_auto-*` folders; [`/autoarchive`](#auto-backup-archiving-autoarchive) sweeps them into their own archives on a schedule). |
 | `-public 0` | Don't list in the community server browser. |
 | `-logFile <path>` | Write the server log to a file. |
 
@@ -185,11 +214,12 @@ The default `Args` mirrors the official `start_headless_server.bat`. Commonly us
 1. **Load config** and verify `ExePath` and `WorkDir` exist (errors out if not).
 2. **Find** the running `valheim_server.exe`.
 3. **Shut down gracefully** — attach to the server's console and send `Ctrl+C`, then wait up to `ShutdownTimeoutSec` for it to exit. Valheim saves the world as part of this shutdown, so the files on disk are current when it exits.
-4. **Back up the worlds** — zip all of `WorldsDir` to `BackupDir\worlds_<timestamp>.zip`.
-5. **Purge logs** — only if `ServerLogDir` is set (off by default; Valheim has no per-session log folder) and **only if the worlds backup succeeded**.
-6. **Back up the lists** — zip the top-level `*.txt` files under `ConfigDir` (adminlist/bannedlist/permittedlist) to `BackupDir\lists_<timestamp>.zip`.
-7. **Update** — if `EnableUpdate=1`, run SteamCMD (`+force_install_dir … +login anonymous +app_update 896660 validate +quit`) and wait for it to finish. SteamCMD's output is captured line-by-line into the log file.
-8. **Wait** `RestartDelaySec`, then **relaunch** the server with `Args` (setting `SteamAppId=892970` in its environment, as the official script does).
+4. **Sweep the auto-backups** (if `RunOnRestart=1`) — archive the `*_backup_auto-*` backup folders to `ArchiveDir` and remove them, exactly as [`/autoarchive`](#auto-backup-archiving-autoarchive) does, so they stay in their own archive and out of the worlds backup. Non-fatal.
+5. **Back up the worlds** — zip each world folder under `WorldsDir` to its own `BackupDir\worlds_<World>_<timestamp>.zip` (any loose legacy files go to `worlds_loose_<timestamp>.zip`). The `*_backup_auto-*` backup folders are excluded here (step 4 handles them).
+6. **Purge logs** — only if `ServerLogDir` is set (off by default; Valheim has no per-session log folder) and **only if the worlds backup succeeded**.
+7. **Back up the lists** — zip the top-level `*.txt` files under `ConfigDir` (adminlist/bannedlist/permittedlist) to `BackupDir\lists_<timestamp>.zip`.
+8. **Update** — if `EnableUpdate=1`, run SteamCMD (`+force_install_dir … +login anonymous +app_update 896660 validate +quit`) and wait for it to finish. SteamCMD's output is captured line-by-line into the log file.
+9. **Wait** `RestartDelaySec`, then **relaunch** the server with `Args` (setting `SteamAppId=892970` in its environment, as the official script does).
 
 A failed/skipped backup is logged but **does not** stop the restart. A failed log purge is logged per-file and is never fatal. A failed/disabled SteamCMD update is logged and the restart still proceeds.
 
@@ -197,20 +227,20 @@ A failed/skipped backup is logged but **does not** stop the restart. A failed lo
 
 ## Auto-backup archiving (`/autoarchive`)
 
-Valheim's built-in rolling backups (`-backupshort`/`-backuplong`) drop full copies of the world into `worlds_local` as `<World>_backup_auto-<timestamp>.db`/`.fwl` — 50 MB+ each on a mature world, accumulating until the folder balloons. This mode sweeps them into timestamped zips on their own schedule:
+Valheim's built-in rolling backups (`-backupshort`/`-backuplong`) drop full copies of the world into `worlds_local` as `<World>_backup_auto-<date>-<time>` **folders** (since 1.0 — 100 MB+ each on a mature world, `.db`/`.fwl` file pairs pre-1.0), accumulating until the folder balloons. This mode sweeps them into timestamped zips on their own schedule:
 
 ```
 ValheimServerRestart.exe /autoarchive
 ```
 
 1. **Load config** (same `.ini`).
-2. **Find** all top-level files in `WorldsDir` matching `FileMask` (default `*_backup_auto-*`).
-3. **Zip** them to `ArchiveDir\auto_<timestamp>.zip`.
-4. **Delete exactly the files that went into the zip** (if `DeleteAfterArchive=1`) — the main `<World>.db`/`.fwl` and the `.old` pair are never touched, and an auto-backup created *after* the file list was taken survives to the next run.
+2. **Find** all top-level entries in `WorldsDir` matching `FileMask` (default `*_backup_auto-*`) — the 1.0 backup **folders** and any legacy backup files.
+3. **Zip each one to its own** `ArchiveDir\auto_<BackupName>_<timestamp>.zip`, preserving the folder inside so a restore recreates it verbatim.
+4. **Delete each archived original** (if `DeleteAfterArchive=1`) — only after its own zip has been written. The live `<World>` folder and the `.old` pair are never touched, and an auto-backup created *after* the entry list was taken survives to the next run.
 
-The server is **not stopped, restarted, or signalled** — this mode never attaches to its console and is safe to run while the server is up: the auto-backup files are finished copies the server is no longer writing. In the unlikely event a file is locked (the server is writing a fresh auto-backup at that exact moment), the zip fails as a whole, **nothing is deleted**, and the next scheduled run picks everything up.
+The server is **not stopped, restarted, or signalled** — this mode never attaches to its console and is safe to run while the server is up: the auto-backups are finished copies the server is no longer writing. If one entry is locked (the server is writing a fresh auto-backup at that exact moment), only *that* entry's zip fails and it is left in place for the next run; the others still archive.
 
-Every run logs its find result explicitly — `Auto-archive: found N file(s) matching *_backup_auto-* in ...` — so there is never a question whether the sweep saw anything. No matching files logs *"Auto-archive: nothing to do"* and exits `0`. Output goes to the same console + `logs\ValheimServerRestart\ValheimServerRestart_yyyy-mm-dd.log`.
+Every run logs its find result explicitly — `Auto-archive: found N backup entr… matching *_backup_auto-* in ... (X folder(s), Y loose file(s))` — so there is never a question whether the sweep saw anything. No matching entries logs *"Auto-archive: nothing to do"* and exits `0`. Output goes to the same console + `logs\ValheimServerRestart\ValheimServerRestart_yyyy-mm-dd.log`.
 
 Schedule it independently of the restart task — see the next section.
 
@@ -302,7 +332,8 @@ Task Scheduler can be configured to alert on non-zero exit codes.
 ## Notes
 
 - The graceful-shutdown mechanism is pure Win32 and needs no mods or wrappers. It is the programmatic equivalent of the officially documented "press Ctrl+C in the server console" — the same mechanism used by established community managers (e.g. ValheimServerWarden) — but as with any inferred behavior, a future Valheim build could change it. If restarts start losing world state after a game update, re-verify the Ctrl+C behavior.
-- Valheim also keeps its own rolling backups (`.old` and auto-backup files) inside `worlds_local`; this tool's zip includes them, giving you point-in-time archives *of* those rolling copies.
+- Since **Valheim 1.0** a world (and each rolling auto-backup) is a *folder*, not a flat `.db`/`.fwl` pair — see [Valheim 1.0 save format](#valheim-10-save-format). This tool zips each world folder to its own archive and sweeps the `<World>_backup_auto-*` backup folders into their own timestamped archives, giving you point-in-time copies *of* those rolling backups.
+- Valheim keeps a one-generation `.old` fallback pair beside a converted world; it is excluded from the worlds backup by default (`[Backup] ExcludeMasks=*.old`) since it is redundant inside a timestamped archive.
 
 ---
 
